@@ -1,128 +1,74 @@
--- =========================
--- 1) Inputs (MRN + window)
--- =========================
-create or replace temporary table tmp_params as
-select :mrn::string as mrn, dateadd(day,-30,current_date) as start_date;
+CREATE OR REPLACE TEMP TABLE TEMP_MRN AS
+SELECT '1234567'::VARCHAR AS MRN;  -- <- replace with your MRN
 
--- Encounter spine for this MRN (last 30d)
-create or replace temporary table tmp_enc as
-select distinct ef.EncounterKey
-from EncounterFact ef
-join PatientDim p on ef.PatientKey = p.PatientKey
-join DateDim dA on ef.AdmitDateKey = dA.DateKey
-join tmp_params prm on 1=1
-where dA.DateValue >= prm.start_date
-  and coalesce(p.MedicalRecordNumber,p.EnterpriseMRN,p.PrimaryMrn,p.MRN)=prm.mrn;
+-- 1) Resolve MRN -> Encounter(s)
+CREATE OR REPLACE TEMP TABLE TEMP_ENC AS
+SELECT e.EncounterKey,
+       e.AdmitInstant,
+       e.DischargeInstant
+FROM EncounterFact e
+JOIN PatientDim p ON e.PatientKey = p.PatientKey
+JOIN TEMP_MRN m ON p.MRN = m.MRN;
 
--- ============================================
--- 2) Code sets (ICD-10-PCS prefixes & CPT sets)
--- ============================================
--- ICD-10-PCS: Heart & Great Vessels (02*) surgical families
-create or replace temporary table tmp_icd10pcs_prefixes as
-select * from values
-  ('021'),  -- Bypass: CABG (0210-0213 etc.)
-  ('02Q'),  -- Repair: valves, septum, etc.
-  ('02R'),  -- Replacement: valves (e.g., 02RF*, 02RG*, 02RJ*)
-  ('02U')   -- Supplement: valve annuloplasty/rings, etc.
-as t(prefix);
+-- (Optional) pick one encounter: latest with a surgical case
+CREATE OR REPLACE TEMP TABLE TEMP_TARGET_ENC AS
+SELECT e.*
+FROM TEMP_ENC e
+JOIN SurgicalCaseFact s ON s.EncounterKey = e.EncounterKey
+QUALIFY ROW_NUMBER() OVER (ORDER BY s.CaseStartInstant DESC) = 1;
 
--- CPT: explicit ranges/lists for core cardiac surgery
-create or replace temporary table tmp_cpt_ranges as
-select * from values
-  (33400, 33496),  -- Valve repair/replacement family
-  (33510, 33536),  -- CABG (venous/arterial graft counts)
-  (33254, 33259),  -- Maze (open/incisional) base codes
-  (33265, 33266)   -- Maze add-on/endoscopic variants
-as t(min_code, max_code);
+-- 2) Anchor on SurgicalCaseFact (index case)
+CREATE OR REPLACE TEMP TABLE TEMP_CASE AS
+SELECT s.SurgicalCaseKey,
+       s.EncounterKey,
+       s.CaseStartInstant   AS SurgeryStart,
+       s.CaseEndInstant     AS SurgeryEnd,
+       s.PrimaryProcedureKey,
+       pd.ProcedureName     AS PrimaryProcedureName,
+       pd.ProcedureCode,
+       pd.ProcedureCodeType
+FROM SurgicalCaseFact s
+JOIN TEMP_TARGET_ENC te ON te.EncounterKey = s.EncounterKey
+LEFT JOIN ProcedureDim pd ON pd.ProcedureKey = s.PrimaryProcedureKey
+QUALIFY ROW_NUMBER() OVER (PARTITION BY s.EncounterKey ORDER BY s.CaseStartInstant DESC) = 1;
 
-create or replace temporary table tmp_cpt_list as
-select * from values
-  (33202),(33203),(33206),(33207),(33208), -- pacer initial inserts
-  (33212),(33213),(33214),(33221),(33222),(33223), -- generator/lead work (optional)
-  (33224),(33227),(33228),(33229),(33233),         -- generator changes (optional)
-  (33240),(33241),(33249)                          -- ICD system implants
-as t(code);
+-- 3) Phase bounds (admit/discharge + OR start/end)
+CREATE OR REPLACE TEMP TABLE TEMP_BOUNDS AS
+SELECT te.EncounterKey,
+       te.AdmitInstant,
+       te.DischargeInstant,
+       c.SurgeryStart,
+       c.SurgeryEnd,
+       c.PrimaryProcedureName
+FROM TEMP_TARGET_ENC te
+JOIN TEMP_CASE c ON c.EncounterKey = te.EncounterKey;
 
--- ===================================================
--- 3) All procedures in window (by Encounter spine)
--- ===================================================
-create or replace temporary table tmp_all_procs as
-select
-  pf.EncounterKey,
-  pf.PatientKey,
-  pf.ProcedureKey,
-  pd.ProcedureCodeType,
-  pd.ProcedureCode,
-  pd.ProcedureName,
-  dd.DateValue as ProcedureDate,
-  pf.ProcedureInstant
-from ProcedureFact pf
-join tmp_enc e on pf.EncounterKey = e.EncounterKey
-left join ProcedureDim pd on pf.ProcedureKey = pd.ProcedureKey
-left join DateDim dd on pf.ProcedureDateKey = dd.DateKey
-where dd.DateValue >= (select start_date from tmp_params);
+-- 4) All procedures for the encounter
+CREATE OR REPLACE TEMP TABLE TEMP_PROCS AS
+SELECT f.ProcedureEventKey,
+       f.EncounterKey,
+       f.ProcedureStartInstant,
+       f.ProcedureEndInstant,
+       d.ProcedureName,
+       d.ProcedureCategory,
+       d.ProcedureCode,
+       d.ProcedureCodeType
+FROM ProcedureEventFact f
+JOIN ProcedureDim d ON d.ProcedureKey = f.ProcedureKey
+JOIN TEMP_BOUNDS b ON b.EncounterKey = f.EncounterKey;
 
--- ===================================================
--- 4) Cardiac surgeries via codes (no name filters)
--- ===================================================
--- A) ICD-10-PCS filter using prefixes
-create or replace temporary table tmp_cardiac_icd10pcs as
-select ap.*
-from tmp_all_procs ap
-join tmp_icd10pcs_prefixes p
-  on ap.ProcedureCodeType ilike 'ICD-10-PCS'
- and substr(ap.ProcedureCode,1,len(p.prefix)) = p.prefix;
-
--- B) CPT filter using ranges/lists
-create or replace temporary table tmp_cardiac_cpt as
-with cpt_numeric as (
-  select ap.*, try_to_number(ap.ProcedureCode) as cpt_num
-  from tmp_all_procs ap
-  where ap.ProcedureCodeType ilike '%CPT%'
-)
-select c.*
-from cpt_numeric c
-where
-  -- in any curated range
-  exists (
-    select 1 from tmp_cpt_ranges r
-    where c.cpt_num between r.min_code and r.max_code
-  )
-  or
-  -- or in explicit list (e.g., ICD/pacer core codes)
-  exists (
-    select 1 from tmp_cpt_list l
-    where c.cpt_num = l.code
-  );
-
--- ==========================
--- 5) Union + de-duplicate
--- ==========================
-create or replace temporary table tmp_cardiac_surgery as
-select * from tmp_cardiac_icd10pcs
-union all
-select * from tmp_cardiac_cpt;
-
--- Prefer one row per ProcedureKey (keep most recent instant/date)
-create or replace temporary table tmp_cardiac_surgery_dedup as
-select *
-from (
-  select
-    *,
-    row_number() over (
-      partition by ProcedureKey
-      order by coalesce(ProcedureInstant, to_timestamp_ntz(ProcedureDate)) desc
-    ) as rn
-  from tmp_cardiac_surgery
-)
-where rn = 1;
-
--- =======
--- Output
--- =======
-select
-  EncounterKey, PatientKey, ProcedureKey,
-  ProcedureInstant, ProcedureDate,
-  ProcedureCodeType, ProcedureCode, ProcedureName
-from tmp_cardiac_surgery_dedup
-order by coalesce(ProcedureInstant, to_timestamp_ntz(ProcedureDate)) desc, ProcedureKey;
+-- 5) Label phases
+CREATE OR REPLACE TEMP TABLE TEMP_LABELED AS
+SELECT
+  p.*,
+  b.PrimaryProcedureName AS IndexSurgery,
+  CASE
+    WHEN p.ProcedureStartInstant <  b.SurgeryStart THEN 'PreOp'
+    WHEN p.ProcedureStartInstant >= b.SurgeryStart
+     AND p.ProcedureStartInstant <= b.SurgeryEnd   THEN 'IntraOp'
+    WHEN p.ProcedureStartInstant >  b.SurgeryEnd
+     AND (b.DischargeInstant IS NULL OR p.ProcedureStartInstant <= b.DischargeInstant) THEN 'PostOp'
+    ELSE 'OutOfBounds'
+  END AS Phase
+FROM TEMP_PROCS p
+JOIN TEMP_BOUNDS b ON b.EncounterKey = p.EncounterKey;
