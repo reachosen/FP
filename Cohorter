@@ -1,74 +1,107 @@
-CREATE OR REPLACE TEMP TABLE TEMP_MRN AS
-SELECT '1234567'::VARCHAR AS MRN;  -- <- replace with your MRN
+-- 0) Params (edit as needed)
+create or replace temporary table #p as
+select
+  to_date(dateadd(month,-12,current_date)) as start_dt,
+  current_date as end_dt,
+  array_construct('%NORWOOD%','%GLENN%','%FONTAN%','%ARTERIAL SWITCH%',
+                  '%TETRALOGY%','%VSD%','%AV CANAL%','%COARCT%','%VALVE%',
+                  '%TRANSPLANT%') as proc_like_any,
+  array_construct('PEDIATRIC CARDIAC SURGERY','CARDIAC SURGERY') as svc_names,
+  array_construct('HB CARDIAC') as proc_categories;   -- use if present
+;
 
--- 1) Resolve MRN -> Encounter(s)
-CREATE OR REPLACE TEMP TABLE TEMP_ENC AS
-SELECT e.EncounterKey,
-       e.AdmitInstant,
-       e.DischargeInstant
-FROM EncounterFact e
-JOIN PatientDim p ON e.PatientKey = p.PatientKey
-JOIN TEMP_MRN m ON p.MRN = m.MRN;
+-- Assumption: temp_env(EncounterKey, PrimaryMRN) already exists
 
--- (Optional) pick one encounter: latest with a surgical case
-CREATE OR REPLACE TEMP TABLE TEMP_TARGET_ENC AS
-SELECT e.*
-FROM TEMP_ENC e
-JOIN SurgicalCaseFact s ON s.EncounterKey = e.EncounterKey
-QUALIFY ROW_NUMBER() OVER (ORDER BY s.CaseStartInstant DESC) = 1;
+-- 1) All surgical cases for those encounters in window
+create or replace temporary table #cases as
+select
+  e.PrimaryMRN,
+  scf.EncounterKey,
+  scf.SurgicalCaseKey,
+  scf.CaseDateTime       as CaseStartDts,
+  scf.CaseEndDateTime    as CaseEndDts,
+  scf.AnesthesiaStartDateTime as AnesStartDts,
+  scf.AnesthesiaEndDateTime   as AnesEndDts,
+  scf.PrimaryProcedureKey
+from temp_env e
+join SurgicalCaseFact scf
+  on scf.EncounterKey = e.EncounterKey
+join #p p
+  on scf.CaseDateTime >= p.start_dt
+ and scf.CaseDateTime <  p.end_dt
+;
 
--- 2) Anchor on SurgicalCaseFact (index case)
-CREATE OR REPLACE TEMP TABLE TEMP_CASE AS
-SELECT s.SurgicalCaseKey,
-       s.EncounterKey,
-       s.CaseStartInstant   AS SurgeryStart,
-       s.CaseEndInstant     AS SurgeryEnd,
-       s.PrimaryProcedureKey,
-       pd.ProcedureName     AS PrimaryProcedureName,
-       pd.ProcedureCode,
-       pd.ProcedureCodeType
-FROM SurgicalCaseFact s
-JOIN TEMP_TARGET_ENC te ON te.EncounterKey = s.EncounterKey
-LEFT JOIN ProcedureDim pd ON pd.ProcedureKey = s.PrimaryProcedureKey
-QUALIFY ROW_NUMBER() OVER (PARTITION BY s.EncounterKey ORDER BY s.CaseStartInstant DESC) = 1;
+-- 2) Attach procedures (names/categories) per case
+create or replace temporary table #case_procs as
+select
+  c.*,
+  pb.ProcedureKey,
+  pd.ProcedureName       as ProcName,
+  pd.ProcedureCategory   as ProcCategory,
+  pd.ServiceName         as ProcService
+from #cases c
+left join ProcedureBridge pb
+  on pb.SurgicalCaseKey = c.SurgicalCaseKey
+left join ProcedureDim pd
+  on pd.ProcedureKey = pb.ProcedureKey
+;
 
--- 3) Phase bounds (admit/discharge + OR start/end)
-CREATE OR REPLACE TEMP TABLE TEMP_BOUNDS AS
-SELECT te.EncounterKey,
-       te.AdmitInstant,
-       te.DischargeInstant,
-       c.SurgeryStart,
-       c.SurgeryEnd,
-       c.PrimaryProcedureName
-FROM TEMP_TARGET_ENC te
-JOIN TEMP_CASE c ON c.EncounterKey = te.EncounterKey;
+-- 3) Keep only “cardiac” cases (use any predicate you have)
+create or replace temporary table #cardiac_cases as
+select cp.*
+from #case_procs cp, #p p
+where
+      (cp.ProcName ilike any (p.proc_like_any))
+   or (cp.ProcCategory is not null and cp.ProcCategory in (select column1 from lateral flatten(input=>p.proc_categories)))
+   or (cp.ProcService   is not null and cp.ProcService   in (select column1 from lateral flatten(input=>p.svc_names)))
+;
 
--- 4) All procedures for the encounter
-CREATE OR REPLACE TEMP TABLE TEMP_PROCS AS
-SELECT f.ProcedureEventKey,
-       f.EncounterKey,
-       f.ProcedureStartInstant,
-       f.ProcedureEndInstant,
-       d.ProcedureName,
-       d.ProcedureCategory,
-       d.ProcedureCode,
-       d.ProcedureCodeType
-FROM ProcedureEventFact f
-JOIN ProcedureDim d ON d.ProcedureKey = f.ProcedureKey
-JOIN TEMP_BOUNDS b ON b.EncounterKey = f.EncounterKey;
+-- 4) Pick one primary procedure per case (explicit primary -> longest -> alphabetical)
+create or replace temporary table #primary_case as
+with r as (
+  select
+    cc.PrimaryMRN, cc.EncounterKey, cc.SurgicalCaseKey,
+    coalesce(cc.AnesStartDts, cc.CaseStartDts) as OpStartDts,
+    coalesce(cc.AnesEndDts,   cc.CaseEndDts)   as OpEndDts,
+    cc.ProcName, cc.ProcCategory, cc.ProcService, cc.ProcedureKey, cc.PrimaryProcedureKey,
+    case when cc.PrimaryProcedureKey is not null and cc.ProcedureKey = cc.PrimaryProcedureKey then 1 else 0 end as is_primary,
+    datediff('minute', coalesce(cc.AnesStartDts, cc.CaseStartDts), coalesce(cc.AnesEndDts, cc.CaseEndDts)) as op_minutes
+  from #cardiac_cases cc
+)
+select *
+from (
+  select r.*,
+         row_number() over (
+           partition by r.SurgicalCaseKey
+           order by r.is_primary desc, r.op_minutes desc nulls last, coalesce(r.ProcName,'~') asc
+         ) as rn
+  from r
+) x
+where rn = 1
+;
 
--- 5) Label phases
-CREATE OR REPLACE TEMP TABLE TEMP_LABELED AS
-SELECT
-  p.*,
-  b.PrimaryProcedureName AS IndexSurgery,
-  CASE
-    WHEN p.ProcedureStartInstant <  b.SurgeryStart THEN 'PreOp'
-    WHEN p.ProcedureStartInstant >= b.SurgeryStart
-     AND p.ProcedureStartInstant <= b.SurgeryEnd   THEN 'IntraOp'
-    WHEN p.ProcedureStartInstant >  b.SurgeryEnd
-     AND (b.DischargeInstant IS NULL OR p.ProcedureStartInstant <= b.DischargeInstant) THEN 'PostOp'
-    ELSE 'OutOfBounds'
-  END AS Phase
-FROM TEMP_PROCS p
-JOIN TEMP_BOUNDS b ON b.EncounterKey = p.EncounterKey;
+-- 5) Final base view with phase windows (plug-and-play)
+create or replace view V_FP_BASE as
+select
+  pc.PrimaryMRN,
+  pc.EncounterKey,
+  pc.SurgicalCaseKey,
+  pc.ProcName          as IndexProcedureName,
+  pc.ProcCategory,
+  pc.ProcService,
+  ef.AdmitDateTime     as AdmitDts,
+  ef.DischargeDateTime as DischargeDts,
+  pc.OpStartDts,
+  pc.OpEndDts,
+  coalesce(ef.AdmitDateTime, dateadd(day,-7, pc.OpStartDts))        as PreOpStartDts,
+  pc.OpStartDts                                                   as PreOpEndDts,
+  pc.OpStartDts                                                   as IntraOpStartDts,
+  pc.OpEndDts                                                     as IntraOpEndDts,
+  pc.OpEndDts                                                     as PostOpStartDts,
+  coalesce(ef.DischargeDateTime, dateadd(day,30, pc.OpEndDts))      as PostOpEndDts,
+  datediff('day', pc.OpEndDts, ef.DischargeDateTime)                as HospDaysPostOp,
+  datediff('day', ef.AdmitDateTime, ef.DischargeDateTime)           as TotalLOS_Days
+from #primary_case pc
+left join EncounterFact ef
+  on ef.EncounterKey = pc.EncounterKey
+;
