@@ -1,107 +1,126 @@
--- 0) Params (edit as needed)
-create or replace temporary table #p as
-select
-  to_date(dateadd(month,-12,current_date)) as start_dt,
-  current_date as end_dt,
-  array_construct('%NORWOOD%','%GLENN%','%FONTAN%','%ARTERIAL SWITCH%',
-                  '%TETRALOGY%','%VSD%','%AV CANAL%','%COARCT%','%VALVE%',
-                  '%TRANSPLANT%') as proc_like_any,
-  array_construct('PEDIATRIC CARDIAC SURGERY','CARDIAC SURGERY') as svc_names,
-  array_construct('HB CARDIAC') as proc_categories;   -- use if present
-;
+-- ================================================
+-- Flight Plan Query Scaffolding with Complications
+-- ================================================
+-- Purpose: Build index cases, phase windows, and classify
+--          procedures + complications into Pre/Intra/Post
+-- ================================================
 
--- Assumption: temp_env(EncounterKey, PrimaryMRN) already exists
+-- 0) Seed cohort (replace MRNs as needed)
+create or replace temporary table tmp_mrn as
+select column1 as PrimaryMRN
+from values
+    ('MRN1'),
+    ('MRN2'),
+    ('MRN3');
 
--- 1) All surgical cases for those encounters in window
-create or replace temporary table #cases as
-select
-  e.PrimaryMRN,
-  scf.EncounterKey,
-  scf.SurgicalCaseKey,
-  scf.CaseDateTime       as CaseStartDts,
-  scf.CaseEndDateTime    as CaseEndDts,
-  scf.AnesthesiaStartDateTime as AnesStartDts,
-  scf.AnesthesiaEndDateTime   as AnesEndDts,
-  scf.PrimaryProcedureKey
-from temp_env e
-join SurgicalCaseFact scf
-  on scf.EncounterKey = e.EncounterKey
-join #p p
-  on scf.CaseDateTime >= p.start_dt
- and scf.CaseDateTime <  p.end_dt
-;
+-- 1) Subset cases to cohort
+create or replace temporary table cases_subset as
+select c.*
+from cases c
+join tmp_mrn m
+  on c.PrimaryMRN = m.PrimaryMRN;
 
--- 2) Attach procedures (names/categories) per case
-create or replace temporary table #case_procs as
-select
-  c.*,
-  pb.ProcedureKey,
-  pd.ProcedureName       as ProcName,
-  pd.ProcedureCategory   as ProcCategory,
-  pd.ServiceName         as ProcService
-from #cases c
-left join ProcedureBridge pb
-  on pb.SurgicalCaseKey = c.SurgicalCaseKey
-left join ProcedureDim pd
-  on pd.ProcedureKey = pb.ProcedureKey
-;
-
--- 3) Keep only “cardiac” cases (use any predicate you have)
-create or replace temporary table #cardiac_cases as
-select cp.*
-from #case_procs cp, #p p
-where
-      (cp.ProcName ilike any (p.proc_like_any))
-   or (cp.ProcCategory is not null and cp.ProcCategory in (select column1 from lateral flatten(input=>p.proc_categories)))
-   or (cp.ProcService   is not null and cp.ProcService   in (select column1 from lateral flatten(input=>p.svc_names)))
-;
-
--- 4) Pick one primary procedure per case (explicit primary -> longest -> alphabetical)
-create or replace temporary table #primary_case as
-with r as (
-  select
-    cc.PrimaryMRN, cc.EncounterKey, cc.SurgicalCaseKey,
-    coalesce(cc.AnesStartDts, cc.CaseStartDts) as OpStartDts,
-    coalesce(cc.AnesEndDts,   cc.CaseEndDts)   as OpEndDts,
-    cc.ProcName, cc.ProcCategory, cc.ProcService, cc.ProcedureKey, cc.PrimaryProcedureKey,
-    case when cc.PrimaryProcedureKey is not null and cc.ProcedureKey = cc.PrimaryProcedureKey then 1 else 0 end as is_primary,
-    datediff('minute', coalesce(cc.AnesStartDts, cc.CaseStartDts), coalesce(cc.AnesEndDts, cc.CaseEndDts)) as op_minutes
-  from #cardiac_cases cc
-)
+-- 2) Identify index cardiac case per MRN + encounter
+create or replace temporary table index_case as
 select *
 from (
-  select r.*,
-         row_number() over (
-           partition by r.SurgicalCaseKey
-           order by r.is_primary desc, r.op_minutes desc nulls last, coalesce(r.ProcName,'~') asc
-         ) as rn
-  from r
+  select
+      c.*,
+      row_number() over (
+        partition by c.PrimaryMRN, c.HOSPITALENCOUNTERKEY
+        order by
+          c.anesthesiastartinstant asc nulls last,
+          c.SurgeryDate asc nulls last
+      ) as rn
+  from cases_subset c
+  where
+        (c.ProcShortName ilike any ('%NORWOOD%','%FONTAN%','%GLENN%','%ASO%','%VSD%','%AV CANAL%','%COARCT%','%VALVE%'))
+     or (c.PrimaryProcedureName ilike any ('%TRANSPLANT%','%VAD%','%HEART%','%TETRALOGY%','%TRUNCUS%','%ARTERIAL SWITCH%'))
 ) x
-where rn = 1
-;
+where rn = 1;
 
--- 5) Final base view with phase windows (plug-and-play)
+-- 3) Join encounter for admit/discharge and define windows
+create or replace temporary table index_case_with_enc as
+select
+    i.PrimaryMRN,
+    i.HOSPITALENCOUNTERKEY,
+    i.SurgicalCaseKey,
+    i.SurgeryDate,
+    i.anesthesiastartinstant,
+    i.anesthesiaendinstant,
+    ef.AdmitDateTime,
+    ef.DischargeDateTime,
+    i.PrimaryProcedureName,
+    i.ProcShortName
+from index_case i
+left join EncounterFact ef
+  on ef.EncounterKey = i.HOSPITALENCOUNTERKEY;
+
+-- 4) Define phase windows
 create or replace view V_FP_BASE as
 select
-  pc.PrimaryMRN,
-  pc.EncounterKey,
-  pc.SurgicalCaseKey,
-  pc.ProcName          as IndexProcedureName,
-  pc.ProcCategory,
-  pc.ProcService,
-  ef.AdmitDateTime     as AdmitDts,
-  ef.DischargeDateTime as DischargeDts,
-  pc.OpStartDts,
-  pc.OpEndDts,
-  coalesce(ef.AdmitDateTime, dateadd(day,-7, pc.OpStartDts))        as PreOpStartDts,
-  pc.OpStartDts                                                   as PreOpEndDts,
-  pc.OpStartDts                                                   as IntraOpStartDts,
-  pc.OpEndDts                                                     as IntraOpEndDts,
-  pc.OpEndDts                                                     as PostOpStartDts,
-  coalesce(ef.DischargeDateTime, dateadd(day,30, pc.OpEndDts))      as PostOpEndDts,
-  datediff('day', pc.OpEndDts, ef.DischargeDateTime)                as HospDaysPostOp,
-  datediff('day', ef.AdmitDateTime, ef.DischargeDateTime)           as TotalLOS_Days
-from #primary_case pc
-left join EncounterFact ef
-  on ef.EncounterKey = pc.EncounterKey
-;
+    PrimaryMRN,
+    HOSPITALENCOUNTERKEY,
+    SurgicalCaseKey,
+    PrimaryProcedureName,
+    ProcShortName,
+    SurgeryDate,
+    coalesce(AdmitDateTime, dateadd(day,-180,SurgeryDate))   as PreOpStartDts,
+    coalesce(anesthesiastartinstant, SurgeryDate)            as PreOpEndDts,
+    coalesce(anesthesiastartinstant, SurgeryDate)            as IntraOpStartDts,
+    coalesce(anesthesiaendinstant, SurgeryDate)              as IntraOpEndDts,
+    coalesce(anesthesiaendinstant, SurgeryDate)              as PostOpStartDts,
+    coalesce(DischargeDateTime, dateadd(day,540,SurgeryDate)) as PostOpEndDts
+from index_case_with_enc;
+
+-- 5) Classify procedure events into phases
+create or replace view V_FP_EVENTS as
+select
+    p.PatientKey,
+    p.EncounterKey,
+    p.ProcedureName,
+    p.ProcedureShortName,
+    p.ProcedureCategory,
+    p.ProcedureDate,
+    p.procedurestartinstant,
+    p.procedureendinstant,
+    b.PrimaryMRN,
+    b.SurgeryDate,
+    case
+      when p.procedurestartinstant <  b.PreOpEndDts then 'Pre-Op'
+      when p.procedurestartinstant between b.IntraOpStartDts and b.IntraOpEndDts then 'Intra-Op'
+      when p.procedurestartinstant >= b.PostOpStartDts then 'Post-Op'
+      else 'Unclassified'
+    end as Phase
+from tmp_all_procs p
+join V_FP_BASE b
+  on p.EncounterKey = b.HOSPITALENCOUNTERKEY
+ and p.ProcedureDate between b.PreOpStartDts and b.PostOpEndDts;
+
+-- 6) Integrate complications (using ComplicationFact)
+-- Assumption: ComplicationFact includes ComplicationKey, PatientKey, SurgicalCaseKey, ProcedureDurableKey, ProcedureKey, ComplicationName
+
+create or replace view V_FP_COMPLICATIONS as
+select
+    cf.ComplicationKey,
+    cf.PatientKey,
+    cf.SurgicalCaseKey,
+    cf.ProcedureDurableKey,
+    cf.ProcedureKey,
+    cf.ComplicationName,
+    b.PrimaryMRN,
+    b.HOSPITALENCOUNTERKEY,
+    b.SurgeryDate,
+    case
+      when cf.SurgicalCaseKey = b.SurgicalCaseKey then 'Intra-Op'
+      when b.AnesthesiaEndInstant is not null and b.DischargeDateTime is not null then 'Post-Op'
+      else 'Unclassified'
+    end as Phase
+from ComplicationFact cf
+join V_FP_BASE b
+  on cf.PatientKey = b.SurgicalCaseKey  -- adjust join condition as needed based on schema
+     or cf.SurgicalCaseKey = b.SurgicalCaseKey;
+
+-- ================================================
+-- End of Script
+-- ================================================
